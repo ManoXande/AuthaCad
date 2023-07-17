@@ -12,37 +12,22 @@ def are_floats_equal(f1, f2, tolerance=1e-9):
 def is_point_close(point1, point2, tolerance=1e-6):
     return math.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2) < tolerance
 
-def round_coordinates(coords, decimal_places=3):
-    return [round(coord, decimal_places) for coord in coords]
-
-def flatten(t):
-    return [item for sublist in t for item in sublist]
-
-def extract_polyline_coordinates(cached_entity):
-    coords = round_coordinates(cached_entity.Coordinates)
-    vertices_groups = [(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
-    return {'Type': 'Polyline', 'Coordinates': vertices_groups}
-
-def extract_cogopoint_coordinates(cached_entity):
-    properties = ['Easting', 'Northing', 'Elevation', 'RawDescription', 'Number']
-    extracted_properties = {prop: round(float(getattr(cached_entity, prop)), 3) if isinstance(getattr(cached_entity, prop), float) else getattr(cached_entity, prop) for prop in properties}
-    return {'Type': 'CogoPoint', **extracted_properties}
-
-def extract_text_coordinates(cached_entity):
-    properties = ['InsertionPoint', 'TextString']
-    extracted_properties = {prop: getattr(cached_entity, prop) for prop in properties}
-    extracted_properties['InsertionPoint'] = tuple(round_coordinates(extracted_properties['InsertionPoint'][:2]))
-    return {'Type': 'Text', **extracted_properties}
-
 def extract_coordinates(entity):
     try:
         cached_entity = Cached(entity)
         if cached_entity.EntityName == 'AcDbPolyline':
-            return extract_polyline_coordinates(cached_entity)
+            coords = [round(coord, 3) for coord in cached_entity.Coordinates]
+            vertices_groups = [(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
+            return {'Type': 'Polyline', 'Coordinates': vertices_groups}
         elif cached_entity.EntityName == 'AeccDbCogoPoint':
-            return extract_cogopoint_coordinates(cached_entity)
+            properties = ['Easting', 'Northing', 'Elevation', 'RawDescription', 'Number']
+            extracted_properties = {prop: round(float(getattr(cached_entity, prop)), 3) if isinstance(getattr(cached_entity, prop), float) else getattr(cached_entity, prop) for prop in properties}
+            return {'Type': 'CogoPoint', **extracted_properties}
         elif cached_entity.EntityName == 'AcDbText' or cached_entity.EntityName == 'AcDbMText':
-            return extract_text_coordinates(cached_entity)
+            properties = ['InsertionPoint', 'TextString']
+            extracted_properties = {prop: getattr(cached_entity, prop) for prop in properties}
+            extracted_properties['InsertionPoint'] = tuple(round(coord, 3) for coord in extracted_properties['InsertionPoint'][:2])
+            return {'Type': 'Text', **extracted_properties}
         else:
             logging.warning(f"Unsupported entity type: {cached_entity.EntityName} for entity: {cached_entity}")
             return None
@@ -52,6 +37,7 @@ def extract_coordinates(entity):
 
 def is_point_in_polygon(point, polygon):
     x, y = point
+    polygon = list(zip(polygon[::2], polygon[1::2]))  # Create pairs of coordinates
     n = len(polygon)
     inside = False
 
@@ -70,15 +56,20 @@ def is_point_in_polygon(point, polygon):
     return inside
 
 def get_center(vertices):
-    x_coords = [vertex[0] for vertex in vertices]
-    y_coords = [vertex[1] for vertex in vertices]
+    x_coords = [vertices[i] for i in range(0, len(vertices), 2)]
+    y_coords = [vertices[i] for i in range(1, len(vertices), 2)]
     return sum(x_coords) / len(x_coords), sum(y_coords) / len(y_coords)
 
 def calculate_distance(point1, point2):
-    distance = math.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
-    return round(distance, 2)
+    return math.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
 
-def get_nearest_text(entity, center, vertices, selection_set):
+def get_text_inside_polyline(entity, selection_set):
+    if entity.EntityName != 'AcDbPolyline':
+        return None, None
+
+    vertices = entity.Coordinates
+    center = get_center(vertices)
+
     inner_texts = []
     min_distance = float('inf')
     nearest_text = ""
@@ -97,7 +88,6 @@ def get_nearest_text(entity, center, vertices, selection_set):
 
     return (re.sub(r'\\pxqc;', '', nearest_text) if nearest_text else "No text found", nearest_text_unclean)
 
-
 def get_all_entity_names(selection_set):
     """Return a set of all entity names in the selection set."""
     entity_names = set()
@@ -109,7 +99,7 @@ def get_all_entity_names(selection_set):
             raise e
     return entity_names
 
-def get_vertex_info(entity, selection_set, vertex, tolerance=1e-6):
+def get_vertex_name(entity, selection_set, vertex, tolerance=1e-6):
     all_entity_names = get_all_entity_names(selection_set)
     cogopoint_names = {name for name in all_entity_names if 'cogopoint' in name.lower()}
 
@@ -122,90 +112,6 @@ def get_vertex_info(entity, selection_set, vertex, tolerance=1e-6):
                 return f"V{point_number}", point_elevation
     print(f"No matching CogoPoint found for vertex: {vertex}")
     return "Vertex not found", None
-
-def calculate_azimuth(current_vertex, next_vertex):
-    delta_x = next_vertex[0] - current_vertex[0]
-    delta_y = next_vertex[1] - current_vertex[1]
-    azimuth_rad = math.atan2(delta_x, delta_y)
-    azimuth_deg = math.degrees(azimuth_rad)
-    if azimuth_deg < 0:
-        azimuth_deg += 360
-
-    degrees = int(azimuth_deg)
-    minutes = int((azimuth_deg - degrees) * 60)
-    seconds = round(((azimuth_deg - degrees) * 60 - minutes) * 60, 2)
-
-    return degrees, minutes, seconds
-
-def find_adjacent_polyline(selection_set, entity, current_vertex, next_vertex):
-    for other_entity in selection_set:
-        if other_entity.Handle == entity.Handle:
-            continue
-        other_info = extract_coordinates(other_entity)
-        if other_info is not None and other_info['Type'] == 'Polyline':
-            other_vertices = other_info['Coordinates']
-
-            if any(are_floats_equal(v[0], current_vertex[0]) and are_floats_equal(v[1], current_vertex[1]) for v in other_vertices) and \
-               any(are_floats_equal(v[0], next_vertex[0]) and are_floats_equal(v[1], next_vertex[1]) for v in other_vertices):
-                return other_entity
-    return None
-
-def generate_text_from_polyline(entity, selection_set):
-    entity_info = extract_coordinates(entity)
-    if entity_info is None or entity_info['Type'] != 'Polyline':
-        return None
-
-    vertices = entity_info['Coordinates']
-    area = round(entity.Area, 2)  # convert to m²
-    perimeter = round(entity.Length, 2)  # convert to m
-    text_inside, text_inside_unclean = get_nearest_text(entity, get_center(vertices), vertices, selection_set)
-
-    lot_number = re.search(r'Lote nº (\d+)', text_inside_unclean)  # extract from uncleaned text
-    lot_number = lot_number.group(1) if lot_number else 'XX'  # 'XX' if not found
-
-    quad_number = re.search(r'Quadra (\w+)', text_inside_unclean)
-    quad_number = quad_number.group(1) if quad_number else 'XX'  # 'XX' if not found
-    area_text = num2words(area, lang='pt_BR')
-
-    # Replace "LOTE Nº XX" with the nearest text inside the polyline
-    header_text = template_header.render(lot_number=text_inside, quad_number=quad_number, area=area, area_text=area_text)
-
-    descriptions = []
-
-    for i in range(len(vertices)):
-        current_vertex = vertices[i]
-        next_vertex = vertices[(i+1) % len(vertices)]
-
-        tolerance = 0.001  
-
-        current_vertex_name, current_vertex_elevation = get_vertex_info(entity, selection_set, current_vertex, tolerance)
-        next_vertex_name, next_vertex_elevation = get_vertex_info(entity, selection_set, next_vertex, tolerance)
-
-        if are_floats_equal(current_vertex[0], next_vertex[0]) and are_floats_equal(current_vertex[1], next_vertex[1]):
-            continue
-
-        distance = calculate_distance(current_vertex, next_vertex)
-        degrees, minutes, seconds = calculate_azimuth(current_vertex, next_vertex)
-        seconds_str = f"{seconds:.2f}"
-
-        adjacent_polyline = find_adjacent_polyline(selection_set, entity, current_vertex, next_vertex)
-
-        adjacent_text = "No confrontante found"
-        if adjacent_polyline:
-            adjacent_text = get_nearest_text(adjacent_polyline, get_center(vertices), vertices, selection_set)[0]
-
-        # Render the description
-        if i == 0:
-            description = template_initial.render(current_vertex_name=current_vertex_name, current_vertex=current_vertex, current_vertex_elevation=current_vertex_elevation, adjacent_text=adjacent_text, degrees=degrees, minutes=minutes, seconds=seconds_str, distance=distance, next_vertex_name=next_vertex_name, next_vertex=next_vertex, next_vertex_elevation=next_vertex_elevation)
-        else:
-            description = template_other.render(adjacent_text=adjacent_text, degrees=degrees, minutes=minutes, seconds=seconds_str, distance=distance, next_vertex_name=next_vertex_name, next_vertex=next_vertex, next_vertex_elevation=next_vertex_elevation)
-
-        descriptions.append(description)
-
-    descriptions_text = '\n'.join(descriptions)
-    final_text = template_final.render()
-
-    return f"{header_text}\n\n{descriptions_text}\n{final_text}\n"
 
 acad = pyautocad.Autocad(create_if_not_exists=True)
 acad.prompt("Select entities\n")
@@ -224,14 +130,99 @@ else:
 
 selection_set.SelectOnScreen()
 
-# Define the template
-template_initial = Template("                Inicia-se a descrição deste perímetro no vértice {{ current_vertex_name }}, georreferenciado no Sistema Geodésico Brasileiro, DATUM - SIRGAS2000, MC-51°W, de coordenadas N {{ current_vertex[1] }}m e E {{ current_vertex[0] }}m de altitude {{ current_vertex_elevation }}m; deste segue confrontando com {{ adjacent_text }}, com azimute de {{ degrees }}°{{ minutes }}'{{ seconds }}\" por uma distância de {{ distance }}m até o vértice {{ next_vertex_name }}, de coordenadas N {{ next_vertex[1] }}m e E {{ next_vertex[0] }}m de altitude {{ next_vertex_elevation }}m;")
-template_other = Template("                Deste segue confrontando com {{ adjacent_text }}, com azimute de {{ degrees }}°{{ minutes }}'{{ seconds }}\" por uma distância de {{ distance }}m até o vértice {{ next_vertex_name }}, de coordenadas N {{ next_vertex[1] }}m e E {{ next_vertex[0] }}m de altitude {{ next_vertex_elevation }}m;")
-template_final = Template("                Todas as coordenadas aqui descritas estão georreferenciadas ao Sistema Geodésico Brasileiro e encontram-se representadas no Sistema UTM, referenciadas ao Meridiano Central nº 51 WGr, tendo como Datum o SIRGAS2000. Todos os azimutes e distâncias, área e perímetro foram calculados no plano de projeção UTM.")
-template_header = Template("                {{ lot_number }} da QUADRA “{{ quad_number }}”, com área de {{ area }}m² ({{ area_text }}), com a seguinte descrição:")
+template_initial = Template("Inicia-se a descrição deste perímetro no vértice {{ current_vertex_name }}, georreferenciado no Sistema Geodésico Brasileiro, DATUM - SIRGAS2000, MC-51°W, de coordenadas N {{ current_vertex[1] }}m e E {{ current_vertex[0] }}m de altitude {{ current_vertex_elevation }}m; deste segue confrontando com {{ adjacent_text }}, com azimute de {{ degrees }}°{{ minutes }}'{{ seconds }}\" por uma distância de {{ distance }}m até o vértice {{ next_vertex_name }}, de coordenadas N {{ next_vertex[1] }}m e E {{ next_vertex[0] }}m de altitude {{ next_vertex_elevation }}m;")
+template_other = Template("Deste segue confrontando com {{ adjacent_text }}, com azimute de {{ degrees }}°{{ minutes }}'{{ seconds }}\" por uma distância de {{ distance }}m até o vértice {{ next_vertex_name }}, de coordenadas N {{ next_vertex[1] }}m e E {{ next_vertex[0] }}m de altitude {{ next_vertex_elevation }}m;")
+template_final = Template("Todas as coordenadas aqui descritas estão georreferenciadas ao Sistema Geodésico Brasileiro e encontram-se representadas no Sistema UTM, referenciadas ao Meridiano Central nº 51 WGr, tendo como Datum o SIRGAS2000. Todos os azimutes e distâncias, área e perímetro foram calculados no plano de projeção UTM.")
+template_header = Template("{{ lot_number }} da QUADRA “XX”, com área de {{ area }}m² ({{ area_text }}), com a seguinte descrição:")
+template_table = Template("Lado {{ current_vertex_name }}->{{ next_vertex_name }}: {{ current_vertex_name }}({{ current_vertex[0] }}, {{ current_vertex[1] }}, {{ current_vertex_elevation }}) -> {{ next_vertex_name }}({{ next_vertex[0] }}, {{ next_vertex[1] }}, {{ next_vertex_elevation }}), Distância: {{ distance }} m, Azimute: {{ degrees }}°{{ minutes }}'{{ seconds }}\"; ")
+ 
+def generate_text_from_polyline(entity, selection_set, text_inside, text_inside_unclean):
+    entity_info = extract_coordinates(entity)
+    if entity_info is None or entity_info['Type'] != 'Polyline':
+        return None
+
+    vertices = entity_info['Coordinates']
+    area = round(entity.Area, 2)  # convert to m²
+    perimeter = round(entity.Length, 2)  # convert to m
+
+    lot_number = re.search(r'Lote nº (\d+)', text_inside_unclean)  # extract from uncleaned text
+    lot_number = lot_number.group(1) if lot_number else text_inside  # replace 'XX' with text_inside if not found
+
+    quad_number = re.search(r'Quadra (\w+)', text_inside_unclean)
+    quad_number = quad_number.group(1) if quad_number else text_inside  # replace 'XX' with text_inside if not found
+    area_text = num2words(area, lang='pt_BR')
+
+    # Replace "LOTE Nº XX" with the nearest text inside the polyline
+    header_text = template_header.render(lot_number=lot_number, quad_number=quad_number, area=area, area_text=area_text)
+    
+    descriptions = []
+
+
+    for i in range(len(vertices)):
+        current_vertex = vertices[i]
+        next_vertex = vertices[(i+1) % len(vertices)]
+
+        tolerance = 0.001  
+
+        current_vertex_name, current_vertex_elevation = get_vertex_name(entity, selection_set, current_vertex, tolerance)
+        next_vertex_name, next_vertex_elevation = get_vertex_name(entity, selection_set, next_vertex, tolerance)
+
+        if are_floats_equal(current_vertex[0], next_vertex[0]) and are_floats_equal(current_vertex[1], next_vertex[1]):
+            continue
+
+        distance = round(math.sqrt((next_vertex[0] - current_vertex[0]) ** 2 + (next_vertex[1] - current_vertex[1]) ** 2), 2)
+
+        delta_x = next_vertex[0] - current_vertex[0]
+        delta_y = next_vertex[1] - current_vertex[1]
+        azimuth_rad = math.atan2(delta_x, delta_y)
+        azimuth_deg = math.degrees(azimuth_rad)
+        if azimuth_deg < 0:
+            azimuth_deg += 360
+
+        degrees = int(azimuth_deg)
+        minutes = int((azimuth_deg - degrees) * 60)
+        seconds = round(((azimuth_deg - degrees) * 60 - minutes) * 60, 2)
+
+        adjacent_polyline = None
+        for other_entity in selection_set:
+            if other_entity.Handle == entity.Handle:
+                continue
+            other_info = extract_coordinates(other_entity)
+            if other_info is not None and other_info['Type'] == 'Polyline':
+                other_vertices = other_info['Coordinates']
+
+                if any(are_floats_equal(v[0], current_vertex[0]) and are_floats_equal(v[1], current_vertex[1]) for v in other_vertices) and \
+                   any(are_floats_equal(v[0], next_vertex[0]) and are_floats_equal(v[1], next_vertex[1]) for v in other_vertices):
+                    adjacent_polyline = other_entity
+                    break
+
+        adjacent_text = "No confrontante found"
+        if adjacent_polyline:
+            adjacent_text = get_text_inside_polyline(adjacent_polyline, selection_set)[0]
+
+        seconds_str = f"{seconds:.2f}"
+
+        # Render the description
+        if i == 0:
+            description = template_initial.render(current_vertex_name=current_vertex_name, current_vertex=current_vertex, current_vertex_elevation=current_vertex_elevation, adjacent_text=adjacent_text, degrees=degrees, minutes=minutes, seconds=seconds_str, distance=distance, next_vertex_name=next_vertex_name, next_vertex=next_vertex, next_vertex_elevation=next_vertex_elevation)
+        else:
+            description = template_other.render(current_vertex_name=current_vertex_name, current_vertex=current_vertex, current_vertex_elevation=current_vertex_elevation, adjacent_text=adjacent_text, degrees=degrees, minutes=minutes, seconds=seconds_str, distance=distance, next_vertex_name=next_vertex_name, next_vertex=next_vertex, next_vertex_elevation=next_vertex_elevation)
+
+        descriptions.append(description)
+
+        # Render the table line
+        table_line = template_table.render(current_vertex_name=current_vertex_name, current_vertex=current_vertex, current_vertex_elevation=current_vertex_elevation, adjacent_text=adjacent_text, degrees=degrees, minutes=minutes, seconds=seconds_str, distance=distance, next_vertex_name=next_vertex_name, next_vertex=next_vertex, next_vertex_elevation=next_vertex_elevation)
+        print(table_line)
+        
+        
+    descriptions_text = '\n'.join(descriptions)
+    final_text = template_final.render()
+
+    # Print old formatted text
+    print(f"{header_text}\n\n{descriptions_text}\n{final_text}\n")
 
 # Use the function for each polyline in the selection set
 for entity in selection_set:
-    text = generate_text_from_polyline(entity, selection_set)
-    if text:
-        print(text)
+    if entity.EntityName == 'AcDbPolyline':
+        text_inside, text_inside_unclean = get_text_inside_polyline(entity, selection_set)
+        generate_text_from_polyline(entity, selection_set, text_inside, text_inside_unclean)
